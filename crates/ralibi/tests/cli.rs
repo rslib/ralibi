@@ -33,7 +33,8 @@ fn run<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>) -> (i32, String,
 
 fn ralibi(dir: &Path, args: &[&str]) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ralibi"));
-    c.args(args).current_dir(dir);
+    // scrub attribution env so "neither" cases are not poisoned by the outer shell
+    c.args(args).current_dir(dir).env_remove("RALIBI_AGENT");
     let out = c.output().unwrap();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
@@ -141,6 +142,41 @@ fn show_records_in_order_and_empty_ledger() {
     let pos_13 = out.find("task=1.3").unwrap();
     assert!(pos_11 < pos_13, "records must print in run order. out: {out}");
     assert!(out.contains("command=true") && out.contains("command=false"));
+}
+
+#[test]
+fn agent_attribution_flag_env_neither() {
+    let repo = setup("agent");
+    // flag recorded
+    let (code, out, _) = ralibi(&repo, &["run", "--toon", "--agent", "verify", "1.1", "--", "true"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("agent=verify"), "out: {out}");
+    // flag wins over env
+    let (code, out, _) = ralibi_env(&repo, &["run", "--toon", "--agent", "pi", "1.2", "--", "true"], Some("reader"));
+    assert_eq!(code, 0);
+    assert!(out.contains("agent=pi") && !out.contains("agent=reader"), "out: {out}");
+    // env fallback
+    let (code, out, _) = ralibi_env(&repo, &["run", "--toon", "1.3", "--", "true"], Some("reader"));
+    assert_eq!(code, 0);
+    assert!(out.contains("agent=reader"), "out: {out}");
+    // neither: no agent in run output, and show carries an empty agent field
+    let (code, out, _) = ralibi(&repo, &["run", "--toon", "1.1", "--", "true"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("agent="), "out: {out}");
+    let (_, show, _) = ralibi(&repo, &["show", "--toon"]);
+    assert!(show.contains("agent=verify"), "show: {show}");
+}
+
+fn ralibi_env(dir: &Path, args: &[&str], agent: Option<&str>) -> (i32, String, String) {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ralibi"));
+    c.args(args).current_dir(dir);
+    if let Some(a) = agent {
+        c.env("RALIBI_AGENT", a);
+    } else {
+        c.env_remove("RALIBI_AGENT");
+    }
+    let out = c.output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 #[test]

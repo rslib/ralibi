@@ -46,6 +46,7 @@ pub struct Record {
     pub head: String,
     pub date: String,
     pub machine: String,
+    pub agent: Option<String>,
 }
 
 impl Record {
@@ -158,16 +159,19 @@ pub fn read_head(repo: &Path) -> String {
 }
 
 /// One appended section per run keeps the file strictly append-only (inserting a run under a
-/// task's earlier section mid-file would rewrite existing bytes).
+/// task's earlier section mid-file would rewrite existing bytes). The `| agent <name>` tail is
+/// rendered only when an agent is recorded, so pre-change records keep their exact shape.
 fn render_section(rec: &Record) -> String {
+    let agent = rec.agent.as_deref().map(|a| format!(" | agent {a}")).unwrap_or_default();
     format!(
-        "\n## {}\n\n- run: {} | exit {} | {:.1}s | head {} | machine {}\n  `{}`\n",
+        "\n## {}\n\n- run: {} | exit {} | {:.1}s | head {} | machine {}{}\n  `{}`\n",
         rec.task,
         rec.date,
         rec.exit,
         rec.duration_ms as f64 / 1000.0,
         rec.head,
         rec.machine,
+        agent,
         rec.command
     )
 }
@@ -289,6 +293,10 @@ pub fn read_records(ledger: &Path) -> Vec<Record> {
                 head: fields[3].strip_prefix("head ").unwrap_or("").trim().to_string(),
                 date: fields[0].trim().to_string(),
                 machine: fields[4].strip_prefix("machine ").unwrap_or("").trim().to_string(),
+                agent: fields
+                    .get(5)
+                    .and_then(|f| f.strip_prefix("agent "))
+                    .map(|a| a.trim().to_string()),
             });
         } else if let Some(cmd) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
             if let Some(mut rec) = pending.take() {
@@ -320,6 +328,7 @@ mod tests {
             head: "1a2b3c4".into(),
             date: "2026-09-29T21:40:12+07:00".into(),
             machine: "goby".into(),
+            agent: None,
         }
     }
 
@@ -412,6 +421,44 @@ mod tests {
         fs::create_dir_all(&arch).unwrap();
         fs::write(arch.join("tasks.md"), "- [ ] 9.9 old\n").unwrap();
         assert_eq!(in_flight_changes(&root), vec!["live-one".to_string()]);
+    }
+
+    #[test]
+    fn round_trip_with_agent() {
+        let dir = scratch("agent-rt");
+        let ledger = ledger_path(&dir);
+        let mut rec = sample();
+        rec.agent = Some("verify".into());
+        append_record(&ledger, "agent-records", &rec).unwrap();
+        let md = fs::read_to_string(&ledger).unwrap();
+        assert!(md.contains("| agent verify"), "ledger: {md}");
+        assert_eq!(read_records(&ledger), vec![rec]);
+    }
+
+    #[test]
+    fn pre_change_record_parses_to_no_agent() {
+        let dir = scratch("pre-change");
+        let ledger = ledger_path(&dir);
+        // the exact run-line shape written before agent attribution existed
+        fs::write(&ledger,
+            "# Alibi\n\nchange: old\n\n## 2.1\n\n- run: 2026-09-29T21:40:12.000+07:00 | exit 0 | 4.1s | head 1a2b3c4 | machine goby\n  `cargo test`\n").unwrap();
+        let records = read_records(&ledger);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.agent, None);
+        assert_eq!(rec.task, "2.1");
+        assert_eq!(rec.exit, 0);
+        assert_eq!(rec.command, "cargo test");
+    }
+
+    #[test]
+    fn round_trip_without_agent_keeps_shape() {
+        let dir = scratch("no-agent");
+        let ledger = ledger_path(&dir);
+        append_record(&ledger, "agent-records", &sample()).unwrap();
+        let md = fs::read_to_string(&ledger).unwrap();
+        assert!(!md.lines().any(|l| l.contains("| agent ")), "no agent field may render: {md}");
+        assert_eq!(read_records(&ledger), vec![sample()]);
     }
 
     #[test]

@@ -20,6 +20,7 @@ struct Args {
     task: Option<String>,
     command: Vec<String>,
     stale_as_fail: bool,
+    agent: Option<String>,
 }
 
 const USAGE: &str = "usage: ralibi <command> [options]
@@ -33,10 +34,11 @@ commands:
 
 options:
   --toon                      machine-readable output (agents pass this)
-  --change <id>               select the change (default: the single in-flight one)";
+  --change <id>               select the change (default: the single in-flight one)
+  --agent <name>              attribute the proof run to an agent (env RALIBI_AGENT as fallback)";
 
 fn parse_args(argv: &[String]) -> std::result::Result<Args, i32> {
-    let mut args = Args { cmd: String::new(), toon: false, change: None, task: None, command: Vec::new(), stale_as_fail: false };
+    let mut args = Args { cmd: String::new(), toon: false, change: None, task: None, command: Vec::new(), stale_as_fail: false, agent: None };
     let mut words = argv.iter();
     let Some(sub) = words.next() else {
         eprintln!("{USAGE}");
@@ -62,6 +64,10 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, i32> {
                     args.change = it.next().map(|v| v.to_string());
                 } else if let Some(id) = w.strip_prefix("--change=") {
                     args.change = Some(id.to_string());
+                } else if w == "--agent" {
+                    args.agent = it.next().map(|v| v.to_string());
+                } else if let Some(name) = w.strip_prefix("--agent=") {
+                    args.agent = Some(name.to_string());
                 } else {
                     eprintln!("ralibi run: unknown option '{w}'\n{USAGE}");
                     return Err(2);
@@ -170,7 +176,7 @@ fn proof_state(ctx: &Ctx, task_id: &str) -> Proof {
     }
 }
 
-fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool) -> std::result::Result<i32, CoreError> {
+fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Option<String>) -> std::result::Result<i32, CoreError> {
     if !ctx.tasks.iter().any(|t| t.id == task_id) {
         return Err(CoreError {
             code: "unknown-task".into(),
@@ -194,18 +200,23 @@ fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool) -> std::res
                 head: read_head(&ctx.root),
                 date: Record::now_date(),
                 machine: Record::machine_name(),
+                agent,
             };
             append_record(&ledger_path(&ctx.change_dir), &ctx.change, &rec)?;
+            let mut pairs = vec![
+                ("type", "run".to_string()),
+                ("task", rec.task.clone()),
+                ("exit", rec.exit.to_string()),
+                ("duration_ms", rec.duration_ms.to_string()),
+                ("head", rec.head.clone()),
+                ("machine", rec.machine.clone()),
+                ("ledger", ledger_path(&ctx.change_dir).display().to_string()),
+            ];
+            if let Some(a) = &rec.agent {
+                pairs.push(("agent", a.clone()));
+            }
             if toon {
-                println!("{}", kv(&[
-                    ("type", "run".into()),
-                    ("task", rec.task.clone()),
-                    ("exit", rec.exit.to_string()),
-                    ("duration_ms", rec.duration_ms.to_string()),
-                    ("head", rec.head.clone()),
-                    ("machine", rec.machine.clone()),
-                    ("ledger", ledger_path(&ctx.change_dir).display().to_string()),
-                ]));
+                println!("{}", kv(&pairs));
             } else {
                 println!("recorded: {} exit {} ({:.1}s) -> {}", rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, ledger_path(&ctx.change_dir).display());
             }
@@ -300,6 +311,7 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
                 ("head", rec.head.clone()),
                 ("date", rec.date.clone()),
                 ("machine", rec.machine.clone()),
+                ("agent", rec.agent.clone().unwrap_or_default()),
             ]));
         }
     } else {
@@ -319,8 +331,13 @@ fn main() {
     };
     match &ctx_for(args.change.as_deref()) {
         Ok(ctx) => {
+            // flag wins over the env; absent both, no attribution is recorded
+            let agent = args
+                .agent
+                .clone()
+                .or_else(|| std::env::var("RALIBI_AGENT").ok().filter(|v| !v.is_empty()));
             let code = match args.cmd.as_str() {
-                "run" => cmd_run(ctx, args.task.as_deref().unwrap(), &args.command, args.toon),
+                "run" => cmd_run(ctx, args.task.as_deref().unwrap(), &args.command, args.toon, agent),
                 "status" => cmd_status(ctx, args.toon).map(|_| 0),
                 "gate" => cmd_gate(ctx, args.toon, args.stale_as_fail),
                 "show" => cmd_show(ctx, args.toon).map(|_| 0),
