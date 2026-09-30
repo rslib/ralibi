@@ -180,64 +180,61 @@ fn ralibi_env(dir: &Path, args: &[&str], agent: Option<&str>) -> (i32, String, S
 }
 
 #[test]
-fn install_links_skips_uninstalls_and_runs_anywhere() {
+fn install_writes_skips_and_runs_anywhere() {
     // scratch has no openspec tree above it: install must still work
     let work = scratch("install-cwd");
     let home = scratch("install-home");
     fs::create_dir_all(home.join(".pi/agent/skills")).unwrap();
-    fs::create_dir_all(home.join(".claude/skills/ralibi")).unwrap(); // real dir: refused on install, left on uninstall
-    // install: pi linked, claude refused (real dir), others skipped (parents absent)
+    // install: pi written, claude refused (different real content), codex skipped (parent absent)
+    fs::create_dir_all(home.join(".claude/skills/ralibi")).unwrap();
+    fs::write(home.join(".claude/skills/ralibi/SKILL.md"), "user's own notes\n").unwrap();
     let (code, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, None);
     assert_eq!(code, 1, "refused entry makes the run nonzero. out: {out}");
-    assert!(out.contains("harness=pi state=linked"), "out: {out}");
-    assert!(out.contains("harness=claude state=refused"), "out: {out}");
+    assert!(out.contains("harness=pi state=written"), "out: {out}");
+    assert!(out.contains("harness=claude state=refused reason=different-content"), "out: {out}");
     assert!(out.contains("harness=codex state=skipped reason=missing-parent"), "out: {out}");
-    let link = fs::read_link(home.join(".pi/agent/skills/ralibi")).unwrap();
-    assert!(link.join("SKILL.md").is_file(), "link must resolve to a real skill: {link:?}");
-    // uninstall: pi removed, claude's real dir left
-    let (code, out, _) = ralibi_env2(&work, &["install", "--toon", "--uninstall"], &home, None);
-    assert_eq!(code, 0, "out: {out}");
-    assert!(out.contains("harness=pi state=removed"), "out: {out}");
-    assert!(out.contains("harness=claude state=left reason=not-a-symlink"), "out: {out}");
-    assert!(home.join(".claude/skills/ralibi").is_dir());
-    assert!(!home.join(".pi/agent/skills/ralibi").exists());
-    // foreign symlink is left alone
-    let other = scratch("other-skill-src");
-    fs::create_dir_all(other.join("skills/ralibi")).unwrap();
-    fs::write(other.join("skills/ralibi/SKILL.md"), "---\nname: ralibi\n---\n").unwrap();
-    fs::create_dir_all(home.join(".pi/agent/skills")).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&other, home.join(".pi/agent/skills/ralibi")).unwrap();
-    let (_, out, _) = ralibi_env2(&work, &["install", "--toon", "--uninstall"], &home, None);
-    assert!(out.contains("harness=pi state=left reason=foreign-symlink"), "out: {out}");
+    let installed = fs::read_to_string(home.join(".pi/agent/skills/ralibi/SKILL.md")).unwrap();
+    assert!(installed.contains("name: ralibi"), "installed content must be the embedded skill");
+    // re-install: identical content is unchanged, refused stays refused, still nonzero
+    let (code, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, None);
+    assert_eq!(code, 1);
+    assert!(out.contains("harness=pi state=unchanged"), "out: {out}");
+    assert!(out.contains("harness=claude state=refused"), "out: {out}");
 }
 
 #[test]
-fn install_source_location_and_error_record() {
-    let work = scratch("install-src");
-    let home = scratch("install-src-home");
+fn install_uninstall_and_symlink_replacement() {
+    let work = scratch("install-un");
+    let home = scratch("install-un-home");
     fs::create_dir_all(home.join(".pi/agent/skills")).unwrap();
-    // env override wins and is used even though the walk-up would also succeed
-    let custom = scratch("custom-skill");
-    fs::create_dir_all(&custom).unwrap();
-    fs::write(custom.join("SKILL.md"), "---\nname: ralibi\n---\n").unwrap();
-    let (code, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, Some(&custom));
+    fs::create_dir_all(home.join(".claude/skills")).unwrap();
+    // a dev symlink to identical content is replaced on install, removed on uninstall
+    let repo_like = scratch("repo-like");
+    fs::create_dir_all(repo_like.join("skills/ralibi")).unwrap();
+    let embedded = fs::read_to_string(
+        Path::new(env!("CARGO_BIN_EXE_ralibi")).parent().unwrap().parent().unwrap().parent().unwrap().join("skills/ralibi/SKILL.md"),
+    ).unwrap();
+    fs::write(repo_like.join("skills/ralibi/SKILL.md"), &embedded).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(repo_like.join("skills/ralibi"), home.join(".claude/skills/ralibi")).unwrap();
+    let (_, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, None);
+    assert!(out.contains("harness=claude state=replaced"), "out: {out}");
+    assert!(!home.join(".claude/skills/ralibi").is_symlink());
+    // uninstall: identical removed, modified left
+    fs::write(home.join(".pi/agent/skills/ralibi/SKILL.md"), "edited by hand\n").unwrap();
+    let (code, out, _) = ralibi_env2(&work, &["install", "--toon", "--uninstall"], &home, None);
     assert_eq!(code, 0, "out: {out}");
-    assert_eq!(fs::read_link(home.join(".pi/agent/skills/ralibi")).unwrap(), custom);
-    // env set but invalid: error record naming the fix, no fallback
-    let bad = scratch("bad-skill");
-    let (code, _, err) = ralibi_env2(&work, &["install", "--toon"], &home, Some(&bad));
-    assert_eq!(code, 1);
-    assert!(err.contains("type=error code=no-skill-source"), "err: {err}");
-    assert!(err.contains("fix=") && err.contains("RALIBI_SKILL_DIR"), "err: {err}");
+    assert!(out.contains("harness=pi state=left reason=modified-content"), "out: {out}");
+    assert!(out.contains("harness=claude state=removed"), "out: {out}");
+    assert!(home.join(".pi/agent/skills/ralibi/SKILL.md").is_file());
+    assert!(!home.join(".claude/skills/ralibi").exists());
 }
 
-fn ralibi_env2(dir: &Path, args: &[&str], home: &Path, skill_dir: Option<&Path>) -> (i32, String, String) {
+
+
+fn ralibi_env2(dir: &Path, args: &[&str], home: &Path, _unused: Option<&Path>) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ralibi"));
-    c.args(args).current_dir(dir).env("HOME", home).env_remove("RALIBI_SKILL_DIR").env_remove("RALIBI_AGENT");
-    if let Some(d) = skill_dir {
-        c.env("RALIBI_SKILL_DIR", d);
-    }
+    c.args(args).current_dir(dir).env("HOME", home).env_remove("RALIBI_AGENT");
     let out = c.output().unwrap();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }

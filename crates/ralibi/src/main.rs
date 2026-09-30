@@ -1,7 +1,7 @@
 use ralibi_core::*;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::time::Instant;
 
@@ -348,43 +348,18 @@ const HARNESSES: &[(&str, &str)] = &[
     ("opencode", ".config/opencode/skills"),
 ];
 
-/// Locate the canonical skills/ralibi source: env override, else walk up from the executable.
-fn locate_skill_source() -> std::result::Result<PathBuf, CoreError> {
-    if let Ok(dir) = std::env::var("RALIBI_SKILL_DIR") {
-        let candidate = PathBuf::from(&dir);
-        if candidate.join("SKILL.md").is_file() {
-            return Ok(candidate);
-        }
-        return Err(CoreError {
-            code: "no-skill-source".into(),
-            message: format!("RALIBI_SKILL_DIR={dir} has no SKILL.md"),
-            fix: "point RALIBI_SKILL_DIR at the ralibi repo's skills/ralibi directory".into(),
-        });
-    }
-    let exe = std::env::current_exe()
-        .map_err(|e| CoreError { code: "io".into(), message: format!("cannot read executable path: {e}"), fix: "set RALIBI_SKILL_DIR".into() })?;
-    for ancestor in exe.ancestors().skip(1) {
-        let candidate = ancestor.join("skills").join("ralibi");
-        if candidate.join("SKILL.md").is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(CoreError {
-        code: "no-skill-source".into(),
-        message: "cannot find skills/ralibi/SKILL.md above the executable".into(),
-        fix: "run from the ralibi repository, or set RALIBI_SKILL_DIR to its skills/ralibi directory".into(),
-    })
+/// The skill ships inside the binary (the rkb pattern): install works from any
+/// location, including a cargo-installed copy with no source repo on the machine.
+const EMBEDDED_SKILL: &str = include_str!("../../../skills/ralibi/SKILL.md");
+
+/// Read the SKILL.md content through `dir`, whether dir is real or a symlink. None when absent.
+fn skill_content(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join("SKILL.md")).ok()
 }
 
-/// `ralibi install`: symlink the skill into every harness whose parent exists.
+/// `ralibi install`: write the embedded skill into every harness whose parent exists.
+/// Refuses to clobber real files that differ; --uninstall removes only what matches.
 fn cmd_install(uninstall: bool, toon: bool) -> i32 {
-    let source = match locate_skill_source() {
-        Ok(s) => s,
-        Err(e) => {
-            report(&e, toon);
-            return 1;
-        }
-    };
     let home = match std::env::var("HOME") {
         Ok(h) => PathBuf::from(h),
         Err(_) => {
@@ -392,7 +367,6 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
             return 1;
         }
     };
-    let source_canon = source.canonicalize().unwrap_or(source.clone());
     let mut failures = 0;
     for (name, rel) in HARNESSES {
         let dir = home.join(rel);
@@ -403,36 +377,49 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
             continue;
         }
         if uninstall {
-            match fs::symlink_metadata(&dst) {
-                Ok(md) if md.file_type().is_symlink() => {
-                    let target = fs::canonicalize(&dst).unwrap_or_default();
-                    if target == source_canon {
-                        let _ = fs::remove_file(&dst);
-                        println!("{}", kv(&[("harness", name.to_string()), ("state", "removed".into())]));
+            match skill_content(&dst) {
+                Some(content) if content == EMBEDDED_SKILL => {
+                    let _ = fs::remove_file(dst.join("SKILL.md"));
+                    if !dst.is_symlink() {
+                        let _ = fs::remove_dir(&dst); // only succeeds when empty
                     } else {
-                        println!("{}", kv(&[("harness", name.to_string()), ("state", "left".into()), ("reason", "foreign-symlink".into())]));
+                        let _ = fs::remove_dir_all(&dst);
                     }
+                    println!("{}", kv(&[("harness", name.to_string()), ("state", "removed".into())]));
                 }
-                Ok(_) => println!("{}", kv(&[("harness", name.to_string()), ("state", "left".into()), ("reason", "not-a-symlink".into())])),
-                Err(_) => println!("{}", kv(&[("harness", name.to_string()), ("state", "absent".into())])),
+                Some(_) => println!("{}", kv(&[("harness", name.to_string()), ("state", "left".into()), ("reason", "modified-content".into())])),
+                None => println!("{}", kv(&[("harness", name.to_string()), ("state", "absent".into())])),
             }
             continue;
         }
-        if let Ok(md) = fs::symlink_metadata(&dst) {
-            if md.file_type().is_symlink() {
-                let _ = fs::remove_file(&dst);
-            } else {
-                println!("{}", kv(&[("harness", name.to_string()), ("state", "refused".into()), ("reason", "real-directory-present".into())]));
+        match skill_content(&dst) {
+            // identical real content, already ours: nothing to do. A symlink with identical
+            // content still falls through to replacement, so installs track the binary.
+            Some(content) if content == EMBEDDED_SKILL && !dst.is_symlink() => {
+                println!("{}", kv(&[("harness", name.to_string()), ("state", "unchanged".into())]));
+            }
+            Some(_) if !dst.is_symlink() => {
+                println!("{}", kv(&[("harness", name.to_string()), ("state", "refused".into()), ("reason", "different-content".into())]));
                 failures += 1;
-                continue;
+            }
+            _ => {
+                // missing, or a symlink (dev checkout link): replace with the real file
+                let was_symlink = dst.is_symlink();
+                if let Err(e) = (|| -> std::io::Result<()> {
+                    if was_symlink {
+                        fs::remove_dir_all(&dst)?;
+                    }
+                    fs::create_dir_all(&dst)?;
+                    fs::write(dst.join("SKILL.md"), EMBEDDED_SKILL)
+                })() {
+                    println!("{}", kv(&[("harness", name.to_string()), ("state", "error".into()), ("reason", e.to_string())]));
+                    failures += 1;
+                    continue;
+                }
+                let state = if was_symlink { "replaced" } else { "written" };
+                println!("{}", kv(&[("harness", name.to_string()), ("state", state.into()), ("path", dst.display().to_string())]));
             }
         }
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::os::unix::fs::symlink(&source, &dst)) {
-            println!("{}", kv(&[("harness", name.to_string()), ("state", "error".into()), ("reason", e.to_string())]));
-            failures += 1;
-            continue;
-        }
-        println!("{}", kv(&[("harness", name.to_string()), ("state", "linked".into()), ("path", dst.display().to_string())]));
     }
     if failures == 0 { 0 } else { 1 }
 }
