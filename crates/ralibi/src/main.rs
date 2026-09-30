@@ -1,4 +1,5 @@
 use ralibi_core::*;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as ProcCommand;
@@ -20,6 +21,7 @@ struct Args {
     task: Option<String>,
     command: Vec<String>,
     stale_as_fail: bool,
+    uninstall: bool,
     agent: Option<String>,
 }
 
@@ -31,6 +33,7 @@ commands:
   gate [--change <id>] [--stale-as-fail]
                               exit nonzero while any task lacks proof
   show [--change <id>]        print the ledger trail
+  install [--uninstall]       symlink the ralibi skill into harness skill dirs
 
 options:
   --toon                      machine-readable output (agents pass this)
@@ -38,7 +41,7 @@ options:
   --agent <name>              attribute the proof run to an agent (env RALIBI_AGENT as fallback)";
 
 fn parse_args(argv: &[String]) -> std::result::Result<Args, i32> {
-    let mut args = Args { cmd: String::new(), toon: false, change: None, task: None, command: Vec::new(), stale_as_fail: false, agent: None };
+    let mut args = Args { cmd: String::new(), toon: false, change: None, task: None, command: Vec::new(), stale_as_fail: false, uninstall: false, agent: None };
     let mut words = argv.iter();
     let Some(sub) = words.next() else {
         eprintln!("{USAGE}");
@@ -96,6 +99,19 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, i32> {
                     }
                 }
                 i += 1;
+            }
+        }
+        "install" => {
+            args.cmd = "install".into();
+            for w in rest {
+                match w.as_str() {
+                    "--toon" => args.toon = true,
+                    "--uninstall" => args.uninstall = true,
+                    other => {
+                        eprintln!("ralibi install: unknown option '{other}'\n{USAGE}");
+                        return Err(2);
+                    }
+                }
             }
         }
         "-h" | "--help" | "help" => {
@@ -323,12 +339,114 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
     Ok(())
 }
 
+/// Harness skill dirs, same target list as the skills-repo install.sh.
+const HARNESSES: &[(&str, &str)] = &[
+    ("pi", ".pi/agent/skills"),
+    ("claude", ".claude/skills"),
+    ("omp", ".omp/agent/skills"),
+    ("codex", ".codex/skills"),
+    ("opencode", ".config/opencode/skills"),
+];
+
+/// Locate the canonical skills/ralibi source: env override, else walk up from the executable.
+fn locate_skill_source() -> std::result::Result<PathBuf, CoreError> {
+    if let Ok(dir) = std::env::var("RALIBI_SKILL_DIR") {
+        let candidate = PathBuf::from(&dir);
+        if candidate.join("SKILL.md").is_file() {
+            return Ok(candidate);
+        }
+        return Err(CoreError {
+            code: "no-skill-source".into(),
+            message: format!("RALIBI_SKILL_DIR={dir} has no SKILL.md"),
+            fix: "point RALIBI_SKILL_DIR at the ralibi repo's skills/ralibi directory".into(),
+        });
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| CoreError { code: "io".into(), message: format!("cannot read executable path: {e}"), fix: "set RALIBI_SKILL_DIR".into() })?;
+    for ancestor in exe.ancestors().skip(1) {
+        let candidate = ancestor.join("skills").join("ralibi");
+        if candidate.join("SKILL.md").is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(CoreError {
+        code: "no-skill-source".into(),
+        message: "cannot find skills/ralibi/SKILL.md above the executable".into(),
+        fix: "run from the ralibi repository, or set RALIBI_SKILL_DIR to its skills/ralibi directory".into(),
+    })
+}
+
+/// `ralibi install`: symlink the skill into every harness whose parent exists.
+fn cmd_install(uninstall: bool, toon: bool) -> i32 {
+    let source = match locate_skill_source() {
+        Ok(s) => s,
+        Err(e) => {
+            report(&e, toon);
+            return 1;
+        }
+    };
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => {
+            report(&CoreError { code: "no-home".into(), message: "HOME is not set".into(), fix: "set HOME to the user's directory".into() }, toon);
+            return 1;
+        }
+    };
+    let source_canon = source.canonicalize().unwrap_or(source.clone());
+    let mut failures = 0;
+    for (name, rel) in HARNESSES {
+        let dir = home.join(rel);
+        let parent = dir.parent().expect("skill dir has a parent");
+        let dst = dir.join("ralibi");
+        if !parent.is_dir() {
+            println!("{}", kv(&[("harness", name.to_string()), ("state", "skipped".into()), ("reason", "missing-parent".into())]));
+            continue;
+        }
+        if uninstall {
+            match fs::symlink_metadata(&dst) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    let target = fs::canonicalize(&dst).unwrap_or_default();
+                    if target == source_canon {
+                        let _ = fs::remove_file(&dst);
+                        println!("{}", kv(&[("harness", name.to_string()), ("state", "removed".into())]));
+                    } else {
+                        println!("{}", kv(&[("harness", name.to_string()), ("state", "left".into()), ("reason", "foreign-symlink".into())]));
+                    }
+                }
+                Ok(_) => println!("{}", kv(&[("harness", name.to_string()), ("state", "left".into()), ("reason", "not-a-symlink".into())])),
+                Err(_) => println!("{}", kv(&[("harness", name.to_string()), ("state", "absent".into())])),
+            }
+            continue;
+        }
+        if let Ok(md) = fs::symlink_metadata(&dst) {
+            if md.file_type().is_symlink() {
+                let _ = fs::remove_file(&dst);
+            } else {
+                println!("{}", kv(&[("harness", name.to_string()), ("state", "refused".into()), ("reason", "real-directory-present".into())]));
+                failures += 1;
+                continue;
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::os::unix::fs::symlink(&source, &dst)) {
+            println!("{}", kv(&[("harness", name.to_string()), ("state", "error".into()), ("reason", e.to_string())]));
+            failures += 1;
+            continue;
+        }
+        println!("{}", kv(&[("harness", name.to_string()), ("state", "linked".into()), ("path", dst.display().to_string())]));
+    }
+    if failures == 0 { 0 } else { 1 }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => std::process::exit(code),
     };
+    // install runs before openspec resolution: it works from any directory
+    if args.cmd == "install" {
+        std::process::exit(cmd_install(args.uninstall, args.toon));
+    }
     match &ctx_for(args.change.as_deref()) {
         Ok(ctx) => {
             // flag wins over the env; absent both, no attribution is recorded
