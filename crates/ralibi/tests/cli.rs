@@ -145,6 +145,31 @@ fn show_records_in_order_and_empty_ledger() {
 }
 
 #[test]
+fn failed_latest_run_is_not_proof() {
+    let repo = setup("failed");
+    ralibi(&repo, &["run", "1.1", "--", "true"]);
+    ralibi(&repo, &["run", "1.2", "--", "false"]);
+    ralibi(&repo, &["run", "1.3", "--", "true"]);
+    ralibi(&repo, &["run", "1.3", "--", "false"]);
+    let (_, out, _) = ralibi(&repo, &["status", "--toon"]);
+    assert!(out.contains("task=1.1 state=proved"), "out: {out}");
+    assert!(out.contains("task=1.2 state=failed exit=1"), "out: {out}");
+    // a later failing run takes back an earlier pass
+    assert!(out.contains("task=1.3 state=failed exit=1"), "out: {out}");
+    let (code, out, _) = ralibi(&repo, &["gate", "--toon"]);
+    assert_eq!(code, 1, "out: {out}");
+    assert!(out.contains("task=1.2 state=failed") && !out.contains("state=pass"), "out: {out}");
+    let (code, human, _) = ralibi(&repo, &["gate"]);
+    assert_eq!(code, 1);
+    assert!(human.contains("gate: failed 1.2 (exit 1)"), "human: {human}");
+    // re-proving with a passing run clears it
+    ralibi(&repo, &["run", "1.2", "--", "true"]);
+    ralibi(&repo, &["run", "1.3", "--", "true"]);
+    let (code, out, _) = ralibi(&repo, &["gate", "--toon"]);
+    assert_eq!(code, 0, "out: {out}");
+}
+
+#[test]
 fn show_marks_superseded_records() {
     let repo = setup("superseded");
     ralibi(&repo, &[

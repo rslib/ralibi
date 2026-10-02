@@ -10,6 +10,7 @@ use std::time::Instant;
 enum Proof {
     Proved(Record),
     Stale(Record, StaleReason),
+    Failed(Record),
     Missing,
 }
 
@@ -31,7 +32,7 @@ commands:
   run <task> -- <command...>   run the task's verify command, record proof, exit with its status
   status [--change <id>]       per-task proof state table
   gate [--change <id>] [--stale-as-fail]
-                              exit nonzero while any task lacks proof
+                              exit nonzero while any task lacks passing proof
   show [--change <id>]        print the ledger trail
   install [--uninstall]       symlink the ralibi skill into harness skill dirs
 
@@ -192,9 +193,12 @@ fn proof_state(ctx: &Ctx, task_id: &str) -> Proof {
     let latest = latest_per_task(&ctx.records);
     let Some(rec) = latest.get(task_id) else { return Proof::Missing };
     let rec = rec.clone();
+    if rec.exit != 0 {
+        return Proof::Failed(rec);
+    }
     match staleness(&ctx.root, &ctx.change_dir, &rec) {
-        Some(reason) => Proof::Stale(rec.clone(), reason),
-        None => Proof::Proved(rec.clone()),
+        Some(reason) => Proof::Stale(rec, reason),
+        None => Proof::Proved(rec),
     }
 }
 
@@ -258,6 +262,7 @@ fn cmd_status(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
             match proof_state(ctx, &task.id) {
                 Proof::Proved(rec) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "proved".into()), ("command", rec.command.clone())])),
                 Proof::Stale(rec, reason) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "stale".into()), ("reason", reason.as_str().into()), ("command", rec.command.clone())])),
+                Proof::Failed(rec) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "failed".into()), ("exit", rec.exit.to_string()), ("command", rec.command.clone())])),
                 Proof::Missing => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "missing".into())])),
             }
         }
@@ -267,6 +272,7 @@ fn cmd_status(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
             match proof_state(ctx, &task.id) {
                 Proof::Proved(rec) => println!("  proved  {}  {}", task.id, rec.command),
                 Proof::Stale(rec, reason) => println!("  stale   {}  {} ({})", task.id, rec.command, reason.as_str()),
+                Proof::Failed(rec) => println!("  failed  {}  {} (exit {})", task.id, rec.command, rec.exit),
                 Proof::Missing => println!("  missing {}", task.id),
             }
         }
@@ -276,40 +282,44 @@ fn cmd_status(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
 
 fn cmd_gate(ctx: &Ctx, toon: bool, stale_as_fail: bool) -> std::result::Result<i32, CoreError> {
     let mut missing: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, i32)> = Vec::new();
     let mut stale: Vec<(String, StaleReason)> = Vec::new();
     for task in &ctx.tasks {
         match proof_state(ctx, &task.id) {
             Proof::Proved(_) => {}
             Proof::Stale(_, reason) => stale.push((task.id.clone(), reason)),
+            Proof::Failed(rec) => failed.push((task.id.clone(), rec.exit)),
             Proof::Missing => missing.push(task.id.clone()),
         }
     }
+    let pass = missing.is_empty() && failed.is_empty() && (stale.is_empty() || !stale_as_fail);
     if toon {
         for id in &missing {
             println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "missing".into())]));
         }
+        for (id, exit) in &failed {
+            println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "failed".into()), ("exit", exit.to_string())]));
+        }
         for (id, r) in &stale {
             println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "stale".into()), ("reason", r.as_str().into())]));
         }
-        if missing.is_empty() && (stale.is_empty() || !stale_as_fail) {
+        if pass {
             println!("{}", kv(&[("type", "gate".into()), ("state", "pass".into())]));
         }
-    } else if missing.is_empty() && (stale.is_empty() || !stale_as_fail) {
+    } else if pass {
         println!("gate: pass ({} tasks proved)", ctx.tasks.len());
     } else {
         if !missing.is_empty() {
             println!("gate: missing proof for {}", missing.join(", "));
         }
+        for (id, exit) in &failed {
+            println!("gate: failed {} (exit {})", id, exit);
+        }
         for (id, r) in &stale {
             println!("gate: stale {} ({})", id, r.as_str());
         }
     }
-    let hard_stale = stale_as_fail && !stale.is_empty();
-    if missing.is_empty() && !hard_stale {
-        Ok(0)
-    } else {
-        Ok(1)
-    }
+    Ok(if pass { 0 } else { 1 })
 }
 
 fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
