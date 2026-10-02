@@ -145,6 +145,31 @@ fn show_records_in_order_and_empty_ledger() {
 }
 
 #[test]
+fn show_marks_superseded_records() {
+    let repo = setup("superseded");
+    ralibi(&repo, &[
+        "run", "--toon", "1.1", "--", "sh", "-c", "echo wrong-command-proof",
+    ]);
+    ralibi(&repo, &["run", "--toon", "1.1", "--", "true"]);
+    ralibi(&repo, &["run", "--toon", "1.2", "--", "true"]);
+    let (_, out, _) = ralibi(&repo, &[
+        "show", "--toon",
+        "--change", "alpha",
+    ]);
+    // the first 1.1 run is superseded by the second; 1.2's single run is latest
+    let lines: Vec<&str> = out.lines().filter(|l| l.contains("type=record")).collect();
+    assert_eq!(lines.len(), 3, "out: {out}");
+    assert!(lines[0].contains("task=1.1 state=superseded"), "out: {out}");
+    assert!(lines[1].contains("task=1.1 state=latest"), "out: {out}");
+    assert!(lines[2].contains("task=1.2 state=latest"), "out: {out}");
+    // human output carries the same markers
+    let (_, human, _) = ralibi(&repo, &["show"]);
+    assert!(human.contains("1.1  superseded"), "human: {human}");
+    assert!(human.contains("1.1  latest"), "human: {human}");
+    assert!(human.contains("1.2  latest"), "human: {human}");
+}
+
+#[test]
 fn archived_change_resolves_and_gate_works() {
     let repo = setup("archived");
     ralibi(&repo, &["run", "--toon", "1.1", "--", "true"]);

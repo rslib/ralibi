@@ -183,6 +183,11 @@ fn latest_per_task(records: &[Record]) -> std::collections::HashMap<String, Reco
     latest
 }
 
+/// True when a later record for the same task id exists after `index` in the ledger.
+fn is_superseded(records: &[Record], index: usize) -> bool {
+    records[index + 1..].iter().any(|later| later.task == records[index].task)
+}
+
 fn proof_state(ctx: &Ctx, task_id: &str) -> Proof {
     let latest = latest_per_task(&ctx.records);
     let Some(rec) = latest.get(task_id) else { return Proof::Missing };
@@ -317,11 +322,13 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
         return Ok(());
     }
     if toon {
-        for rec in &ctx.records {
+        for (i, rec) in ctx.records.iter().enumerate() {
+            let state = if is_superseded(&ctx.records, i) { "superseded" } else { "latest" };
             println!("{}", kv(&[
                 ("type", "record".into()),
                 ("change", ctx.change.clone()),
                 ("task", rec.task.clone()),
+                ("state", state.into()),
                 ("command", rec.command.clone()),
                 ("exit", rec.exit.to_string()),
                 ("duration_ms", rec.duration_ms.to_string()),
@@ -332,9 +339,10 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
             ]));
         }
     } else {
-        for rec in &ctx.records {
+        for (i, rec) in ctx.records.iter().enumerate() {
+            let state = if is_superseded(&ctx.records, i) { "superseded" } else { "latest" };
             let short_head = rec.head.get(..7).unwrap_or(&rec.head);
-            println!("{}  {}  exit {}  {:.1}s  head {}  {}", rec.date, rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, short_head, rec.machine);
+            println!("{}  {}  {}  exit {}  {:.1}s  head {}  {}", rec.date, rec.task, state, rec.exit, rec.duration_ms as f64 / 1000.0, short_head, rec.machine);
             println!("  `{}`", rec.command);
         }
     }
