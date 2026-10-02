@@ -374,11 +374,11 @@ pub fn read_records(ledger: &Path) -> Vec<Record> {
                     .and_then(|f| f.strip_prefix("agent "))
                     .map(|a| a.trim().to_string()),
             });
-        } else if let Some(cmd) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
-            if let Some(mut rec) = pending.take() {
-                rec.command = cmd.to_string();
-                records.push(rec);
-            }
+        } else if let Some(cmd) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`'))
+            && let Some(mut rec) = pending.take()
+        {
+            rec.command = cmd.to_string();
+            records.push(rec);
         }
     }
     records

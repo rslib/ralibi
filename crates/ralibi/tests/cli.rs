@@ -14,7 +14,7 @@ fn setup(tag: &str) -> PathBuf {
     run(&repo, ["git", "init", "-q"]);
     run(&repo, ["git", "commit", "-q", "-m", "a", "--allow-empty"]);
     let change = repo.join("openspec").join("changes").join("alpha");
-    fs::create_dir_all(&change.join("specs/ledger")).unwrap();
+    fs::create_dir_all(change.join("specs/ledger")).unwrap();
     fs::write(change.join("tasks.md"),
         "# Tasks\n\n- [ ] 1.1 first; verify true\n- [ ] 1.2 second; verify false\n- [ ] 1.3 third; verify ok\n").unwrap();
     fs::write(change.join("specs/ledger/delta.md"), "## ADDED Requirements\n").unwrap();

@@ -124,11 +124,9 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, i32> {
             return Err(2);
         }
     }
-    if let Some(v) = args.change.as_deref() {
-        if v.is_empty() {
-            eprintln!("--change requires a value");
-            return Err(2);
-        }
+    if args.change.as_deref() == Some("") {
+        eprintln!("--change requires a value");
+        return Err(2);
     }
     Ok(args)
 }
