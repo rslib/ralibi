@@ -80,7 +80,7 @@ fn run_success_and_failure_passthrough_and_unknown_task() {
     assert!(out.contains("exit 3"), "out: {out}");
     let ledger = fs::read_to_string(repo.join("openspec/changes/alpha/alibi.md")).unwrap();
     assert!(ledger.contains("exit 3"));
-    assert!(ledger.contains("sh -c exit 3"));
+    assert!(ledger.contains("sh -c 'exit 3'"));
     // unknown task: error record, appends nothing
     let before = fs::read_to_string(repo.join("openspec/changes/alpha/alibi.md")).unwrap();
     let (code, _, err) = ralibi(&repo, &["run", "--toon", "9.9", "--", "true"]);
@@ -167,6 +167,19 @@ fn failed_latest_run_is_not_proof() {
     ralibi(&repo, &["run", "1.3", "--", "true"]);
     let (code, out, _) = ralibi(&repo, &["gate", "--toon"]);
     assert_eq!(code, 0, "out: {out}");
+}
+
+#[test]
+fn recorded_command_keeps_argument_boundaries() {
+    let repo = setup("quoting");
+    ralibi(&repo, &["run", "1.1", "--", "sh", "-c", "echo \"a b\" | grep -q 'a b'"]);
+    let (_, out, _) = ralibi(&repo, &["show", "--toon"]);
+    assert!(out.contains(r#"command=sh -c 'echo "a b" | grep -q '\''a b'\''"#), "out: {out}");
+    // the recorded line replays as the same command
+    let ledger = fs::read_to_string(repo.join("openspec/changes/alpha/alibi.md")).unwrap();
+    let line = ledger.lines().find_map(|l| l.trim().strip_prefix('`')?.strip_suffix('`')).unwrap();
+    let (code, _, _) = run(&repo, ["sh", "-c", line]);
+    assert_eq!(code, 0, "replay of: {line}");
 }
 
 #[test]

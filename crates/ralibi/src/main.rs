@@ -220,7 +220,7 @@ fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Opti
         Ok(st) => {
             let rec = Record {
                 task: task_id.to_string(),
-                command: command.join(" "),
+                command: shell_join(command),
                 exit: st.code().unwrap_or(-1),
                 duration_ms,
                 head: read_head(&ctx.root),

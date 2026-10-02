@@ -186,6 +186,36 @@ fn strip_date_prefix(name: &str) -> Option<&str> {
     (shape && !rest.is_empty()).then_some(rest)
 }
 
+/// Join argv into one line that a POSIX shell (sh, bash, zsh) parses back into the same argv.
+/// Arguments with control characters use `$'...'` quoting so the ledger line stays one line.
+pub fn shell_join(argv: &[String]) -> String {
+    argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c);
+    if !arg.is_empty() && arg.chars().all(plain) {
+        return arg.to_string();
+    }
+    if !arg.chars().any(|c| c.is_ascii_control()) {
+        return format!("'{}'", arg.replace('\'', "'\\''"));
+    }
+    let mut out = String::from("$'");
+    for c in arg.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// The ledger file of a change: openspec/changes/<id>/alibi.md.
 pub fn ledger_path(change_dir: &Path) -> PathBuf {
     change_dir.join("alibi.md")
@@ -498,6 +528,21 @@ mod tests {
         // the full archived name still resolves
         assert!(resolve_change(&root, Some("2026-01-01-older")).unwrap().dir.ends_with("archive/2026-01-01-older"));
         assert!(resolve_change(&root, Some("01-older")).is_err());
+    }
+
+    #[test]
+    fn shell_join_round_trips_through_sh() {
+        let argv: Vec<String> = ["sh", "-c", "printf '%s|' \"$@\"", "x", "plain", "a b", "it's", "", "$HOME", "*", "l1\nl2", "tab\tq'\\"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let line = shell_join(&argv);
+        assert!(!line.contains('\n'));
+        assert!(line.starts_with("sh -c "));
+        for shell in ["sh", "bash", "zsh"] {
+            let Ok(out) = ProcCommand::new(shell).arg("-c").arg(&line).output() else { continue };
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "plain|a b|it's||$HOME|*|l1\nl2|tab\tq'\\|", "{shell}: {line}");
+        }
     }
 
     #[test]
