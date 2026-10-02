@@ -123,28 +123,67 @@ pub fn in_flight_changes(root: &Path) -> Vec<String> {
     ids
 }
 
+/// The resolved change directory: `changes/<id>` in flight, or its archived location.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedChange {
+    pub id: String,
+    pub dir: PathBuf,
+    pub archived: bool,
+}
+
 /// Resolve the change to act on: the `--change` flag wins, otherwise exactly one in-flight change.
-pub fn resolve_change(root: &Path, flag: Option<&str>) -> Result<String> {
+/// A flagged id that names no in-flight change falls back to the archive, where OpenSpec stores it
+/// as `archive/<id>` or `archive/YYYY-MM-DD-<id>`; in-flight beats archived so a reopened change
+/// shadows its archived self. Auto-resolution without the flag considers in-flight changes only.
+pub fn resolve_change(root: &Path, flag: Option<&str>) -> Result<ResolvedChange> {
+    let changes = root.join("openspec").join("changes");
     if let Some(id) = flag {
-        let dir = root.join("openspec").join("changes").join(id);
-        if !dir.join("tasks.md").is_file() {
-            return Err(err(
-                "unknown-change",
-                format!("no in-flight change named '{id}'"),
-                format!("pick one of: {}", in_flight_changes(root).join(", ")),
-            ));
+        let in_flight = changes.join(id);
+        if in_flight.join("tasks.md").is_file() {
+            return Ok(ResolvedChange { id: id.to_string(), dir: in_flight, archived: false });
         }
-        return Ok(id.to_string());
+        if let Some(dir) = find_archived_change(&changes.join("archive"), id) {
+            return Ok(ResolvedChange { id: id.to_string(), dir, archived: true });
+        }
+        return Err(err(
+            "unknown-change",
+            format!("no in-flight or archived change named '{id}'"),
+            format!("pick one of: {}", in_flight_changes(root).join(", ")),
+        ));
     }
     match in_flight_changes(root).as_slice() {
         [] => Err(err("no-change", "no in-flight changes under the nearest openspec root", "cd into the repository holding the change, or create one")),
-        [one] => Ok(one.clone()),
+        [one] => Ok(ResolvedChange { id: one.clone(), dir: changes.join(one), archived: false }),
         many => Err(err(
             "ambiguous-change",
             format!("{} in-flight changes: {}", many.len(), many.join(", ")),
             "pass --change <id>",
         )),
     }
+}
+
+/// `archive/<id>` when it exists, else the newest `archive/YYYY-MM-DD-<id>`.
+fn find_archived_change(archive: &Path, id: &str) -> Option<PathBuf> {
+    let exact = archive.join(id);
+    if exact.join("tasks.md").is_file() {
+        return Some(exact);
+    }
+    let mut dated: Vec<PathBuf> = fs::read_dir(archive)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_str().and_then(strip_date_prefix) == Some(id))
+        .map(|e| e.path())
+        .filter(|p| p.join("tasks.md").is_file())
+        .collect();
+    dated.sort();
+    dated.pop()
+}
+
+/// The name after a `YYYY-MM-DD-` prefix, the prefix OpenSpec adds when it archives a change.
+fn strip_date_prefix(name: &str) -> Option<&str> {
+    let (date, rest) = (name.get(..11)?, name.get(11..)?);
+    let shape = date.bytes().enumerate().all(|(i, c)| if matches!(i, 4 | 7 | 10) { c == b'-' } else { c.is_ascii_digit() });
+    (shape && !rest.is_empty()).then_some(rest)
 }
 
 /// The ledger file of a change: openspec/changes/<id>/alibi.md.
@@ -396,7 +435,7 @@ mod tests {
         let root = scratch("flag");
         make_change(&root, "alpha");
         make_change(&root, "beta");
-        assert_eq!(resolve_change(&root, Some("beta")).unwrap(), "beta");
+        assert_eq!(resolve_change(&root, Some("beta")).unwrap().id, "beta");
         let e = resolve_change(&root, Some("nope")).unwrap_err();
         assert_eq!(e.code, "unknown-change");
         assert!(e.fix.contains("alpha") && e.fix.contains("beta"));
@@ -406,7 +445,7 @@ mod tests {
     fn single_change_resolves_without_flag() {
         let root = scratch("single");
         make_change(&root, "only-one");
-        assert_eq!(resolve_change(&root, None).unwrap(), "only-one");
+        assert_eq!(resolve_change(&root, None).unwrap().id, "only-one");
     }
 
     #[test]
@@ -428,6 +467,60 @@ mod tests {
         fs::create_dir_all(&arch).unwrap();
         fs::write(arch.join("tasks.md"), "- [ ] 9.9 old\n").unwrap();
         assert_eq!(in_flight_changes(&root), vec!["live-one".to_string()]);
+    }
+
+    #[test]
+    fn archived_change_resolves_by_flag() {
+        let root = scratch("archived-flag");
+        make_change(&root, "live-one");
+        let arch = root.join("openspec").join("changes").join("archive");
+        fs::create_dir_all(arch.join("old-one")).unwrap();
+        fs::write(arch.join("old-one").join("tasks.md"), "- [x] 1.1 done; verify x\n").unwrap();
+        assert_eq!(resolve_change(&root, Some("old-one")).unwrap().id, "old-one");
+        // auto-resolution still ignores the archive
+        assert_eq!(resolve_change(&root, None).unwrap().id, "live-one");
+    }
+
+    #[test]
+    fn date_prefixed_archive_resolves_by_bare_name() {
+        let root = scratch("dated-archive");
+        let arch = root.join("openspec").join("changes").join("archive");
+        for dir in ["2026-01-01-older", "2026-02-01-older", "2026-03-01-older-x", "2026-04-01-older"] {
+            fs::create_dir_all(arch.join(dir)).unwrap();
+        }
+        for dir in ["2026-01-01-older", "2026-02-01-older", "2026-03-01-older-x"] {
+            fs::write(arch.join(dir).join("tasks.md"), "- [x] 1.1 done; verify x\n").unwrap();
+        }
+        // newest dated match with a tasks.md wins; `older-x` is another change
+        let resolved = resolve_change(&root, Some("older")).unwrap();
+        assert_eq!(resolved.id, "older");
+        assert!(resolved.dir.ends_with("archive/2026-02-01-older"));
+        // the full archived name still resolves
+        assert!(resolve_change(&root, Some("2026-01-01-older")).unwrap().dir.ends_with("archive/2026-01-01-older"));
+        assert!(resolve_change(&root, Some("01-older")).is_err());
+    }
+
+    #[test]
+    fn in_flight_shadows_archived_namesake() {
+        let root = scratch("shadow");
+        make_change(&root, "alpha");
+        let arch = root.join("openspec").join("changes").join("archive").join("alpha");
+        fs::create_dir_all(&arch).unwrap();
+        fs::write(arch.join("tasks.md"), "- [x] 1.1 old; verify x\n").unwrap();
+        let resolved = resolve_change(&root, Some("alpha")).unwrap();
+        assert_eq!(resolved.id, "alpha");
+        assert!(!resolved.archived);
+        assert!(resolved.dir.ends_with("changes/alpha"));
+        assert!(resolved.dir.join("tasks.md").is_file());
+    }
+
+    #[test]
+    fn unknown_flag_error_mentions_archive() {
+        let root = scratch("unknown-archived");
+        make_change(&root, "alpha");
+        let e = resolve_change(&root, Some("nope")).unwrap_err();
+        assert_eq!(e.code, "unknown-change");
+        assert!(e.message.contains("archived"));
     }
 
     #[test]

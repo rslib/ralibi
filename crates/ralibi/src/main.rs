@@ -166,8 +166,9 @@ fn ctx_for(change_flag: Option<&str>) -> std::result::Result<Ctx, CoreError> {
             fix: "cd into a repository with an openspec tree".into(),
         });
     };
-    let change = resolve_change(&root, change_flag)?;
-    let change_dir = root.join("openspec").join("changes").join(&change);
+    let resolved = resolve_change(&root, change_flag)?;
+    let change = resolved.id.clone();
+    let change_dir = resolved.dir.clone();
     let tasks = read_tasks(&change_dir)?;
     let records = read_records(&ledger_path(&change_dir));
     Ok(Ctx { root, change, change_dir, tasks, records })

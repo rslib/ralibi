@@ -145,6 +145,32 @@ fn show_records_in_order_and_empty_ledger() {
 }
 
 #[test]
+fn archived_change_resolves_and_gate_works() {
+    let repo = setup("archived");
+    ralibi(&repo, &["run", "--toon", "1.1", "--", "true"]);
+    ralibi(&repo, &["run", "--toon", "1.2", "--", "true"]);
+    ralibi(&repo, &["run", "--toon", "1.3", "--", "true"]);
+    // archive the change the way openspec does: move it to archive/YYYY-MM-DD-<name>
+    let changes = repo.join("openspec/changes");
+    fs::create_dir_all(changes.join("archive")).unwrap();
+    fs::rename(changes.join("alpha"), changes.join("archive").join("2026-10-01-alpha")).unwrap();
+    // flag resolves into the archive
+    let (code, out, _) = ralibi(&repo, &["show", "--toon", "--change", "alpha"]);
+    assert_eq!(code, 0, "out: {out}");
+    assert!(out.contains("task=1.1"), "out: {out}");
+    // auto-resolution still ignores the archive
+    let (code, _, err) = ralibi(&repo, &["status", "--toon"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("code=no-change"), "err: {err}");
+    // gate on the archived change: all tasks have records, so it passes
+    let (code, out, _) = ralibi(&repo, &["gate", "--toon", "--change", "alpha"]);
+    assert_eq!(code, 0, "out: {out}");
+    // unknown name errors mentioning the archive
+    let (_, _, err) = ralibi(&repo, &["status", "--toon", "--change", "nope"]);
+    assert!(err.contains("archived"), "err: {err}");
+}
+
+#[test]
 fn agent_attribution_flag_env_neither() {
     let repo = setup("agent");
     // flag recorded
