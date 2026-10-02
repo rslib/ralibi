@@ -332,7 +332,8 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
         }
     } else {
         for rec in &ctx.records {
-            println!("{}  {}  exit {}  {:.1}s  head {}  {}", rec.date, rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, &rec.head[..rec.head.len().min(7)], rec.machine);
+            let short_head = rec.head.get(..7).unwrap_or(&rec.head);
+            println!("{}  {}  exit {}  {:.1}s  head {}  {}", rec.date, rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, short_head, rec.machine);
             println!("  `{}`", rec.command);
         }
     }
