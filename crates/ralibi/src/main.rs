@@ -412,13 +412,34 @@ const HARNESSES: &[(&str, &str)] = &[
 /// location, including a cargo-installed copy with no source repo on the machine.
 const EMBEDDED_SKILL: &str = include_str!("../../../skills/ralibi/SKILL.md");
 
+/// Fingerprints of skill files that older ralibi versions wrote without a marker. The list is
+/// closed: every install since then ends the file with `MARKER` instead.
+const UNMARKED_SKILLS: &[&str] = &["cf5c2318674ca48b", "8b735a9655c6bb85", "cc564bdedba36c95", "c287dcd4ef34f2c3"];
+
+const MARKER: &str = "<!-- written by ralibi install, fingerprint ";
+
+/// The file content install writes: the embedded skill plus a marker that fingerprints it.
+fn installed_skill() -> String {
+    format!("{EMBEDDED_SKILL}\n{MARKER}{} -->\n", fingerprint(EMBEDDED_SKILL))
+}
+
+/// True when `content` is a skill file some ralibi version wrote and nobody has edited since.
+fn written_by_ralibi(content: &str) -> bool {
+    if UNMARKED_SKILLS.contains(&fingerprint(content).as_str()) {
+        return true;
+    }
+    let Some((body, tail)) = content.rsplit_once(&format!("\n{MARKER}")) else { return false };
+    tail.strip_suffix(" -->\n") == Some(fingerprint(body).as_str())
+}
+
 /// Read the SKILL.md content through `dir`, whether dir is real or a symlink. None when absent.
 fn skill_content(dir: &Path) -> Option<String> {
     fs::read_to_string(dir.join("SKILL.md")).ok()
 }
 
 /// `ralibi install`: write the embedded skill into every harness whose parent exists.
-/// Refuses to clobber real files that differ; --uninstall removes only what matches.
+/// Replaces a file an older install wrote; refuses a file someone edited. --uninstall removes
+/// only files no one edited.
 fn cmd_install(uninstall: bool, toon: bool) -> i32 {
     let home = match std::env::var("HOME") {
         Ok(h) => PathBuf::from(h),
@@ -438,7 +459,7 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
         }
         if uninstall {
             match skill_content(&dst) {
-                Some(content) if content == EMBEDDED_SKILL => {
+                Some(content) if written_by_ralibi(&content) || content == EMBEDDED_SKILL => {
                     let _ = fs::remove_file(dst.join("SKILL.md"));
                     if !dst.is_symlink() {
                         let _ = fs::remove_dir(&dst); // only succeeds when empty
@@ -452,31 +473,39 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
             }
             continue;
         }
-        match skill_content(&dst) {
-            // identical real content, already ours: nothing to do. A symlink with identical
-            // content still falls through to replacement, so installs track the binary.
-            Some(content) if content == EMBEDDED_SKILL && !dst.is_symlink() => {
+        let installed = installed_skill();
+        let content = skill_content(&dst);
+        let older = content.as_deref().is_some_and(|c| c != installed && written_by_ralibi(c));
+        match content {
+            // already the current install: nothing to do. A symlink still falls through to
+            // replacement, so installs track the binary.
+            Some(content) if content == installed && !dst.is_symlink() => {
                 println!("{}", kv(&[("harness", name.to_string()), ("state", "unchanged".into())]));
             }
-            Some(_) if !dst.is_symlink() => {
-                println!("{}", kv(&[("harness", name.to_string()), ("state", "refused".into()), ("reason", "different-content".into())]));
+            Some(_) if !dst.is_symlink() && !older => {
+                println!("{}", kv(&[
+                    ("harness", name.to_string()),
+                    ("state", "refused".into()),
+                    ("reason", "different-content".into()),
+                    ("fix", format!("merge your edits elsewhere and delete {}", dst.join("SKILL.md").display())),
+                ]));
                 failures += 1;
             }
             _ => {
-                // missing, or a symlink (dev checkout link): replace with the real file
+                // missing, a symlink (dev checkout link) or an older unedited install: write the current file
                 let was_symlink = dst.is_symlink();
                 if let Err(e) = (|| -> std::io::Result<()> {
                     if was_symlink {
                         fs::remove_dir_all(&dst)?;
                     }
                     fs::create_dir_all(&dst)?;
-                    fs::write(dst.join("SKILL.md"), EMBEDDED_SKILL)
+                    fs::write(dst.join("SKILL.md"), &installed)
                 })() {
                     println!("{}", kv(&[("harness", name.to_string()), ("state", "error".into()), ("reason", e.to_string())]));
                     failures += 1;
                     continue;
                 }
-                let state = if was_symlink { "replaced" } else { "written" };
+                let state = if was_symlink { "replaced" } else if older { "updated" } else { "written" };
                 println!("{}", kv(&[("harness", name.to_string()), ("state", state.into()), ("path", dst.display().to_string())]));
             }
         }

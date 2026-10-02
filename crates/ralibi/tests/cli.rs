@@ -397,6 +397,46 @@ fn install_uninstall_and_symlink_replacement() {
 
 
 
+#[test]
+fn install_updates_older_unedited_skills_and_refuses_edited_ones() {
+    let work = scratch("install-up");
+    let home = scratch("install-up-home");
+    let pi = home.join(".pi/agent/skills/ralibi/SKILL.md");
+    let claude = home.join(".claude/skills/ralibi/SKILL.md");
+    let codex = home.join(".codex/skills/ralibi/SKILL.md");
+    for f in [&pi, &claude, &codex] {
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+    }
+    // pi: a skill written by an older ralibi with no marker
+    fs::write(&pi, include_str!("skill-1bb3762.md")).unwrap();
+    // claude: the same old skill, then edited by hand
+    fs::write(&claude, format!("{}my note\n", include_str!("skill-1bb3762.md"))).unwrap();
+    let (code, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, None);
+    assert_eq!(code, 1, "out: {out}");
+    assert!(out.contains("harness=pi state=updated"), "out: {out}");
+    assert!(out.contains("harness=codex state=written"), "out: {out}");
+    assert!(out.contains("harness=claude state=refused reason=different-content fix="), "out: {out}");
+    assert!(fs::read_to_string(&claude).unwrap().ends_with("my note\n"), "edited file is untouched");
+    let current = fs::read_to_string(&pi).unwrap();
+    assert!(current.contains("<!-- written by ralibi install, fingerprint "), "{current}");
+    // a marked install from a different ralibi version is replaced too
+    let body = "---\nname: ralibi\n---\nold text\n";
+    let fp = {
+        let hash = body.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        format!("{hash:016x}")
+    };
+    fs::write(&codex, format!("{body}\n<!-- written by ralibi install, fingerprint {fp} -->\n")).unwrap();
+    fs::remove_file(&claude).unwrap();
+    let (code, out, _) = ralibi_env2(&work, &["install", "--toon"], &home, None);
+    assert_eq!(code, 0, "out: {out}");
+    assert!(out.contains("harness=pi state=unchanged") && out.contains("harness=codex state=updated"), "out: {out}");
+    // editing a marked install makes it foreign; uninstall leaves it and removes the rest
+    fs::write(&pi, current.replace("name: ralibi", "name: ralibi-mine")).unwrap();
+    let (_, out, _) = ralibi_env2(&work, &["install", "--toon", "--uninstall"], &home, None);
+    assert!(out.contains("harness=pi state=left") && out.contains("harness=codex state=removed") && out.contains("harness=claude state=removed"), "out: {out}");
+    assert!(pi.is_file() && !codex.exists() && !claude.exists());
+}
+
 fn ralibi_env2(dir: &Path, args: &[&str], home: &Path, _unused: Option<&Path>) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ralibi"));
     c.args(args).current_dir(dir).env("HOME", home).env_remove("RALIBI_AGENT");
