@@ -211,9 +211,7 @@ fn install_uninstall_and_symlink_replacement() {
     // a dev symlink to identical content is replaced on install, removed on uninstall
     let repo_like = scratch("repo-like");
     fs::create_dir_all(repo_like.join("skills/ralibi")).unwrap();
-    let embedded = fs::read_to_string(
-        Path::new(env!("CARGO_BIN_EXE_ralibi")).parent().unwrap().parent().unwrap().parent().unwrap().join("skills/ralibi/SKILL.md"),
-    ).unwrap();
+    let embedded = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/ralibi/SKILL.md")).unwrap();
     fs::write(repo_like.join("skills/ralibi/SKILL.md"), &embedded).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(repo_like.join("skills/ralibi"), home.join(".claude/skills/ralibi")).unwrap();
