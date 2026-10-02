@@ -189,6 +189,7 @@ dependencies = [
 name = "ralibi"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ralibi-core",
 ]
 

@@ -445,6 +445,11 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE, so println! panics when a reader such as `grep -q` closes the pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&argv) {
         Ok(a) => a,

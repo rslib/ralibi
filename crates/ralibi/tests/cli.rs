@@ -183,6 +183,18 @@ fn recorded_command_keeps_argument_boundaries() {
 }
 
 #[test]
+fn closed_pipe_does_not_panic() {
+    let repo = setup("pipe");
+    // far more output than a pipe buffer holds, so the writer hits the closed pipe
+    let record = "\n## 1.1\n\n- run: 2030-01-01T00:00:00.000+00:00 | exit 0 | 0.1s | head abc | machine test\n  `true`\n";
+    fs::write(repo.join("openspec/changes/alpha/alibi.md"), format!("# Alibi\n\nchange: alpha\n{}", record.repeat(5000))).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ralibi");
+    let (code, _, err) = run(&repo, ["sh", "-c", &format!("{bin} show --toon | head -c 1 >/dev/null; sleep 0.1")]);
+    assert_eq!(code, 0);
+    assert!(!err.contains("panicked"), "err: {err}");
+}
+
+#[test]
 fn show_marks_superseded_records() {
     let repo = setup("superseded");
     ralibi(&repo, &[
