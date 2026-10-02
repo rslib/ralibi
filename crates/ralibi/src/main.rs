@@ -1,6 +1,6 @@
 use ralibi_core::*;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::time::Instant;
@@ -149,6 +149,7 @@ struct Ctx {
     change: String,
     change_dir: PathBuf,
     tasks: Vec<Task>,
+    unnumbered: Vec<String>,
     records: Vec<Record>,
 }
 
@@ -168,54 +169,38 @@ fn ctx_for(change_flag: Option<&str>) -> std::result::Result<Ctx, CoreError> {
     let resolved = resolve_change(&root, change_flag)?;
     let change = resolved.id.clone();
     let change_dir = resolved.dir.clone();
-    let tasks = read_tasks(&change_dir)?;
+    let (tasks, unnumbered) = read_tasks(&change_dir)?;
     let records = read_records(&ledger_path(&change_dir));
-    Ok(Ctx { root, change, change_dir, tasks, records })
+    Ok(Ctx { root, change, change_dir, tasks, unnumbered, records })
 }
 
-/// Latest record per task, in ledger order.
-fn latest_per_task(records: &[Record]) -> std::collections::HashMap<String, Record> {
-    let mut latest = std::collections::HashMap::new();
-    for rec in records {
-        latest.insert(rec.task.clone(), rec.clone());
-    }
-    latest
-}
-
-/// True when a later record for the same task id exists after `index` in the ledger.
-fn is_superseded(records: &[Record], index: usize) -> bool {
-    records[index + 1..].iter().any(|later| later.task == records[index].task)
-}
-
-fn proof_state(ctx: &Ctx, task_id: &str) -> Proof {
+fn proof_state(ctx: &Ctx, task: &Task) -> Proof {
     let latest = latest_per_task(&ctx.records);
-    let Some(rec) = latest.get(task_id) else { return Proof::Missing };
-    let rec = rec.clone();
+    let Some(&i) = latest.get(&task.id) else { return Proof::Missing };
+    let rec = ctx.records[i].clone();
     if rec.exit != 0 {
         return Proof::Failed(rec);
     }
-    match staleness(&ctx.root, &ctx.change_dir, &rec) {
+    match staleness(&ctx.root, &ctx.change_dir, &rec, task) {
         Some(reason) => Proof::Stale(rec, reason),
         None => Proof::Proved(rec),
     }
 }
 
 fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Option<String>) -> std::result::Result<i32, CoreError> {
-    if !ctx.tasks.iter().any(|t| t.id == task_id) {
+    let Some(task) = ctx.tasks.iter().find(|t| t.id == task_id) else {
         return Err(CoreError {
             code: "unknown-task".into(),
             message: format!("no task '{task_id}' in change '{}'", ctx.change),
             fix: format!("use one of: {}", ctx.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ")),
         });
-    }
+    };
+    let dirty = capture_dirty(&ctx.root);
     let start = Instant::now();
-    let status = ProcCommand::new(&command[0])
-        .args(&command[1..])
-        .current_dir(&ctx.root)
-        .status();
+    let status = run_teed(&ctx.root, command);
     let duration_ms = start.elapsed().as_millis();
     match status {
-        Ok(st) => {
+        Ok((st, output)) => {
             let rec = Record {
                 task: task_id.to_string(),
                 command: shell_join(command),
@@ -225,6 +210,9 @@ fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Opti
                 date: Record::now_date(),
                 machine: Record::machine_name(),
                 agent,
+                task_hash: Some(fingerprint(&task.title)),
+                dirty,
+                tail: output_tail(&output, 5),
             };
             append_record(&ledger_path(&ctx.change_dir), &ctx.change, &rec)?;
             let mut pairs = vec![
@@ -239,11 +227,16 @@ fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Opti
             if let Some(a) = &rec.agent {
                 pairs.push(("agent", a.clone()));
             }
-            if toon {
-                println!("{}", kv(&pairs));
-            } else {
-                println!("recorded: {} exit {} ({:.1}s) -> {}", rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, ledger_path(&ctx.change_dir).display());
+            if let Some(d) = &rec.dirty {
+                pairs.push(("dirty", d.paths.len().to_string()));
             }
+            // the record is already written; a closed stdout must not turn into a panic exit
+            let line = if toon {
+                kv(&pairs)
+            } else {
+                format!("recorded: {} exit {} ({:.1}s) -> {}", rec.task, rec.exit, rec.duration_ms as f64 / 1000.0, ledger_path(&ctx.change_dir).display())
+            };
+            let _ = writeln!(std::io::stdout(), "{line}");
             Ok(rec.exit)
         }
         Err(e) => Err(CoreError {
@@ -254,25 +247,62 @@ fn cmd_run(ctx: &Ctx, task_id: &str, command: &[String], toon: bool, agent: Opti
     }
 }
 
+/// Run `command` with stdout and stderr merged into one pipe, copied through to our stdout,
+/// and return the exit status with the last 64 KiB of output.
+fn run_teed(root: &Path, command: &[String]) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    const KEEP: usize = 64 * 1024;
+    let (mut reader, writer) = std::io::pipe()?;
+    let mut cmd = ProcCommand::new(&command[0]);
+    cmd.args(&command[1..]).current_dir(root).stdout(writer.try_clone()?).stderr(writer);
+    let mut child = cmd.spawn()?;
+    // our copies of the write end must close, or the read loop never sees EOF
+    drop(cmd);
+    let mut stdout = std::io::stdout();
+    let mut forward = true;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        // keep draining after our reader leaves, so the command never blocks on a full pipe
+        forward = forward && stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_ok();
+        kept.extend_from_slice(&buf[..n]);
+        if kept.len() > 2 * KEEP {
+            kept.drain(..kept.len() - KEEP);
+        }
+    }
+    Ok((child.wait()?, kept))
+}
+
 fn cmd_status(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
     if toon {
         for task in &ctx.tasks {
-            match proof_state(ctx, &task.id) {
+            match proof_state(ctx, task) {
                 Proof::Proved(rec) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "proved".into()), ("command", rec.command.clone())])),
                 Proof::Stale(rec, reason) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "stale".into()), ("reason", reason.as_str().into()), ("command", rec.command.clone())])),
                 Proof::Failed(rec) => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "failed".into()), ("exit", rec.exit.to_string()), ("command", rec.command.clone())])),
                 Proof::Missing => println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("task", task.id.clone()), ("state", "missing".into())])),
             }
         }
+        for line in &ctx.unnumbered {
+            println!("{}", kv(&[("type", "task".into()), ("change", ctx.change.clone()), ("state", "unnumbered".into()), ("line", line.clone())]));
+        }
     } else {
         println!("change: {}", ctx.change);
         for task in &ctx.tasks {
-            match proof_state(ctx, &task.id) {
+            match proof_state(ctx, task) {
                 Proof::Proved(rec) => println!("  proved  {}  {}", task.id, rec.command),
                 Proof::Stale(rec, reason) => println!("  stale   {}  {} ({})", task.id, rec.command, reason.as_str()),
                 Proof::Failed(rec) => println!("  failed  {}  {} (exit {})", task.id, rec.command, rec.exit),
                 Proof::Missing => println!("  missing {}", task.id),
             }
+        }
+        for line in &ctx.unnumbered {
+            println!("  unnumbered  {line}");
         }
     }
     Ok(())
@@ -283,20 +313,23 @@ fn cmd_gate(ctx: &Ctx, toon: bool, stale_as_fail: bool) -> std::result::Result<i
     let mut failed: Vec<(String, i32)> = Vec::new();
     let mut stale: Vec<(String, StaleReason)> = Vec::new();
     for task in &ctx.tasks {
-        match proof_state(ctx, &task.id) {
+        match proof_state(ctx, task) {
             Proof::Proved(_) => {}
             Proof::Stale(_, reason) => stale.push((task.id.clone(), reason)),
             Proof::Failed(rec) => failed.push((task.id.clone(), rec.exit)),
             Proof::Missing => missing.push(task.id.clone()),
         }
     }
-    let pass = missing.is_empty() && failed.is_empty() && (stale.is_empty() || !stale_as_fail);
+    let pass = missing.is_empty() && failed.is_empty() && ctx.unnumbered.is_empty() && (stale.is_empty() || !stale_as_fail);
     if toon {
         for id in &missing {
             println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "missing".into())]));
         }
         for (id, exit) in &failed {
             println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "failed".into()), ("exit", exit.to_string())]));
+        }
+        for line in &ctx.unnumbered {
+            println!("{}", kv(&[("type", "gate".into()), ("state", "unnumbered".into()), ("line", line.clone()), ("fix", "give the task a 1.1-style id so ralibi run can prove it".into())]));
         }
         for (id, r) in &stale {
             println!("{}", kv(&[("type", "gate".into()), ("task", id.clone()), ("state", "stale".into()), ("reason", r.as_str().into())]));
@@ -312,6 +345,9 @@ fn cmd_gate(ctx: &Ctx, toon: bool, stale_as_fail: bool) -> std::result::Result<i
         }
         for (id, exit) in &failed {
             println!("gate: failed {} (exit {})", id, exit);
+        }
+        for line in &ctx.unnumbered {
+            println!("gate: unnumbered task, give it a 1.1-style id: {line}");
         }
         for (id, r) in &stale {
             println!("gate: stale {} ({})", id, r.as_str());
@@ -329,14 +365,15 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
         }
         return Ok(());
     }
+    let latest = latest_per_task(&ctx.records);
+    let state = |i: usize| if latest[&ctx.records[i].task] == i { "latest" } else { "superseded" };
     if toon {
         for (i, rec) in ctx.records.iter().enumerate() {
-            let state = if is_superseded(&ctx.records, i) { "superseded" } else { "latest" };
             println!("{}", kv(&[
                 ("type", "record".into()),
                 ("change", ctx.change.clone()),
                 ("task", rec.task.clone()),
-                ("state", state.into()),
+                ("state", state(i).into()),
                 ("command", rec.command.clone()),
                 ("exit", rec.exit.to_string()),
                 ("duration_ms", rec.duration_ms.to_string()),
@@ -344,14 +381,19 @@ fn cmd_show(ctx: &Ctx, toon: bool) -> std::result::Result<(), CoreError> {
                 ("date", rec.date.clone()),
                 ("machine", rec.machine.clone()),
                 ("agent", rec.agent.clone().unwrap_or_default()),
+                ("dirty", rec.dirty.as_ref().map_or(0, |d| d.paths.len()).to_string()),
+                ("output", rec.tail.last().cloned().unwrap_or_default()),
             ]));
         }
     } else {
         for (i, rec) in ctx.records.iter().enumerate() {
-            let state = if is_superseded(&ctx.records, i) { "superseded" } else { "latest" };
             let short_head = rec.head.get(..7).unwrap_or(&rec.head);
-            println!("{}  {}  {}  exit {}  {:.1}s  head {}  {}", rec.date, rec.task, state, rec.exit, rec.duration_ms as f64 / 1000.0, short_head, rec.machine);
+            let dirty = rec.dirty.as_ref().map(|d| format!("  dirty {}", d.paths.len())).unwrap_or_default();
+            println!("{}  {}  {}  exit {}  {:.1}s  head {}  {}{}", rec.date, rec.task, state(i), rec.exit, rec.duration_ms as f64 / 1000.0, short_head, rec.machine, dirty);
             println!("  `{}`", rec.command);
+            for line in &rec.tail {
+                println!("  > {line}");
+            }
         }
     }
     Ok(())
@@ -443,16 +485,19 @@ fn cmd_install(uninstall: bool, toon: bool) -> i32 {
 }
 
 fn main() {
-    // Rust ignores SIGPIPE, so println! panics when a reader such as `grep -q` closes the pipe.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(code) => std::process::exit(code),
     };
+    // Rust ignores SIGPIPE, so println! panics when a reader such as `grep -q` closes the pipe.
+    // `run` keeps ignoring it: a closed stdout must not kill it before the record is written.
+    #[cfg(unix)]
+    if args.cmd != "run" {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     // install runs before openspec resolution: it works from any directory
     if args.cmd == "install" {
         std::process::exit(cmd_install(args.uninstall, args.toon));

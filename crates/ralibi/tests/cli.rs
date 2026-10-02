@@ -195,6 +195,72 @@ fn closed_pipe_does_not_panic() {
 }
 
 #[test]
+fn run_records_output_tail_and_dirty_tree() {
+    let repo = setup("context");
+    // the setup commit is empty, so the openspec tree is untracked; it must not count as dirty
+    let (code, out, _) = ralibi(&repo, &["run", "--toon", "1.1", "--", "sh", "-c", "echo to-out; echo to-err >&2; exit 0"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("to-out") && out.contains("to-err"), "output is passed through: {out}");
+    assert!(!out.contains("dirty="), "clean tree: {out}");
+    fs::write(repo.join("src.txt"), "edit\n").unwrap();
+    let (_, out, _) = ralibi(&repo, &["run", "--toon", "1.2", "--", "true"]);
+    assert!(out.contains("dirty=1"), "out: {out}");
+    // ralibi never writes to git: nothing is staged
+    let (code, _, _) = run(&repo, ["git", "diff", "--cached", "--quiet"]);
+    assert_eq!(code, 0, "the index must stay untouched");
+    let (_, out, _) = ralibi(&repo, &["show", "--toon"]);
+    assert!(out.contains("task=1.1 state=latest") && out.contains("dirty=0 output=to-err"), "out: {out}");
+    assert!(out.contains("task=1.2 state=latest") && out.contains("dirty=1"), "out: {out}");
+    let (_, human, _) = ralibi(&repo, &["show"]);
+    assert!(human.contains("  > to-out\n  > to-err"), "human: {human}");
+    // editing the tested file after the run makes the proof stale
+    fs::write(repo.join("src.txt"), "edit again\n").unwrap();
+    let (_, out, _) = ralibi(&repo, &["status", "--toon"]);
+    assert!(out.contains("task=1.2 state=stale reason=worktree-changed"), "out: {out}");
+    assert!(out.contains("task=1.1 state=proved"), "out: {out}");
+}
+
+#[test]
+fn edited_verify_clause_makes_proof_stale() {
+    let repo = setup("task-edit");
+    ralibi(&repo, &["run", "1.1", "--", "true"]);
+    let tasks = repo.join("openspec/changes/alpha/tasks.md");
+    // checking the box is not an edit of the task
+    let md = fs::read_to_string(&tasks).unwrap().replace("- [ ] 1.1", "- [x] 1.1");
+    fs::write(&tasks, &md).unwrap();
+    let (_, out, _) = ralibi(&repo, &["status", "--toon"]);
+    assert!(out.contains("task=1.1 state=proved"), "out: {out}");
+    fs::write(&tasks, md.replace("verify true", "verify cargo test")).unwrap();
+    let (_, out, _) = ralibi(&repo, &["status", "--toon"]);
+    assert!(out.contains("task=1.1 state=stale reason=task-changed"), "out: {out}");
+}
+
+#[test]
+fn unnumbered_task_blocks_gate() {
+    let repo = setup("unnumbered");
+    let tasks = repo.join("openspec/changes/alpha/tasks.md");
+    fs::write(&tasks, "* [ ] 1.1 star bullet; verify true\n1. [ ] write the docs\n").unwrap();
+    ralibi(&repo, &["run", "1.1", "--", "true"]);
+    let (_, out, _) = ralibi(&repo, &["status", "--toon"]);
+    assert!(out.contains("task=1.1 state=proved"), "out: {out}");
+    assert!(out.contains("state=unnumbered line=write the docs"), "out: {out}");
+    let (code, out, _) = ralibi(&repo, &["gate", "--toon"]);
+    assert_eq!(code, 1, "out: {out}");
+    assert!(out.contains("state=unnumbered") && !out.contains("state=pass"), "out: {out}");
+}
+
+#[test]
+fn run_records_even_when_its_reader_closes() {
+    let repo = setup("run-pipe");
+    let bin = env!("CARGO_BIN_EXE_ralibi");
+    let (code, _, err) = run(&repo, ["sh", "-c", &format!("{bin} run 1.1 -- sh -c 'seq 1 200000; exit 3' | head -c 1 >/dev/null; sleep 0.2")]);
+    assert_eq!(code, 0);
+    assert!(!err.contains("panicked"), "err: {err}");
+    let (_, out, _) = ralibi(&repo, &["show", "--toon"]);
+    assert!(out.contains("task=1.1") && out.contains("exit=3") && out.contains("output=200000"), "out: {out}");
+}
+
+#[test]
 fn show_marks_superseded_records() {
     let repo = setup("superseded");
     ralibi(&repo, &[

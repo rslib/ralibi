@@ -47,6 +47,19 @@ pub struct Record {
     pub date: String,
     pub machine: String,
     pub agent: Option<String>,
+    /// Fingerprint of the task's line (title and verify clause) at run time.
+    pub task_hash: Option<String>,
+    /// Files outside `openspec/` that differed from HEAD at run time.
+    pub dirty: Option<Dirty>,
+    /// Last non-empty lines of the command's combined stdout and stderr.
+    pub tail: Vec<String>,
+}
+
+/// Uncommitted files at run time: paths relative to the openspec root and a content fingerprint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dirty {
+    pub paths: Vec<String>,
+    pub digest: String,
 }
 
 impl Record {
@@ -66,34 +79,52 @@ impl Record {
 
 /// Extract `1.1`-style task ids and titles from tasks.md content.
 pub fn parse_tasks(md: &str) -> Vec<Task> {
-    let mut tasks = Vec::new();
-    for line in md.lines() {
-        let trimmed = line.trim();
-        // task lines: "- [ ] 1.1 ..." / "- [x] 1.1 ..."
-        let Some(after_box) = trimmed.strip_prefix("- [").and_then(|r| r.split_once(']')) else { continue };
-        let rest = after_box.1.trim_start();
-        let Some((id, title)) = rest.split_once(char::is_whitespace) else {
-            // `- [x] 1.1` with no title: a task id alone still names a provable task
-            let id = rest.trim_end_matches('.');
-            if id.split('.').count() >= 2 && id.bytes().all(|c| c.is_ascii_digit() || c == b'.') && !id.is_empty() {
-                tasks.push(Task { id: id.to_string(), title: String::new() });
-            }
-            continue;
-        };
-        let id = id.trim_end_matches('.');
-        if id.split('.').count() >= 2 && id.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
-            tasks.push(Task { id: id.to_string(), title: title.trim().to_string() });
-        }
-    }
-    tasks
+    md.lines()
+        .filter_map(task_description)
+        .filter_map(numbered)
+        .map(|(id, title)| Task { id: id.to_string(), title: title.to_string() })
+        .collect()
 }
 
-/// Read the task list of a change directory (holds tasks.md).
-pub fn read_tasks(change_dir: &Path) -> Result<Vec<Task>> {
+/// Task lines that carry no `1.1`-style id. ralibi cannot prove them, so the gate refuses them.
+pub fn unnumbered_tasks(md: &str) -> Vec<String> {
+    md.lines()
+        .filter_map(task_description)
+        .filter(|desc| numbered(desc).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
+fn numbered(desc: &str) -> Option<(&str, &str)> {
+    let (id, title) = desc.split_once(char::is_whitespace).unwrap_or((desc, ""));
+    let id = id.trim_end_matches('.');
+    let ok = id.split('.').count() >= 2 && id.split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()));
+    ok.then(|| (id, title.trim()))
+}
+
+/// The description of a checkbox line, accepting the bullets OpenSpec accepts:
+/// `-`, `*`, `+`, `1.` or `1)`, then a box holding at most one non-space mark.
+fn task_description(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = if (1..=9).contains(&digits) && matches!(line.as_bytes().get(digits), Some(b'.' | b')')) {
+        &line[digits + 1..]
+    } else {
+        line.strip_prefix(['-', '*', '+'])?
+    };
+    let (mark, after) = rest.trim_start().strip_prefix('[')?.split_once(']')?;
+    if mark.trim().chars().count() > 1 || after.starts_with(['(', '[']) {
+        return None;
+    }
+    Some(after.trim())
+}
+
+/// Read the task list of a change directory (holds tasks.md): numbered tasks and unnumbered lines.
+pub fn read_tasks(change_dir: &Path) -> Result<(Vec<Task>, Vec<String>)> {
     let path = change_dir.join("tasks.md");
     let md = fs::read_to_string(&path)
         .map_err(|_| err("no-tasks", format!("no tasks.md at {}", path.display()), "run from inside the change's repository"))?;
-    Ok(parse_tasks(&md))
+    Ok((parse_tasks(&md), unnumbered_tasks(&md)))
 }
 
 /// Nearest openspec root at or above `start`: the first ancestor dir holding `openspec/changes`.
@@ -235,21 +266,105 @@ pub fn read_head(repo: &Path) -> String {
 }
 
 /// One appended section per run keeps the file strictly append-only (inserting a run under a
-/// task's earlier section mid-file would rewrite existing bytes). The `| agent <name>` tail is
-/// rendered only when an agent is recorded, so pre-change records keep their exact shape.
+/// task's earlier section mid-file would rewrite existing bytes). Optional fields render only
+/// when present, so a record without them keeps the exact shape older ralibi versions wrote.
 fn render_section(rec: &Record) -> String {
-    let agent = rec.agent.as_deref().map(|a| format!(" | agent {a}")).unwrap_or_default();
-    format!(
-        "\n## {}\n\n- run: {} | exit {} | {:.1}s | head {} | machine {}{}\n  `{}`\n",
-        rec.task,
+    let mut run = format!(
+        "- run: {} | exit {} | {:.1}s | head {} | machine {}",
         rec.date,
         rec.exit,
         rec.duration_ms as f64 / 1000.0,
         rec.head,
-        rec.machine,
-        agent,
-        rec.command
-    )
+        rec.machine
+    );
+    if let Some(a) = &rec.agent {
+        run += &format!(" | agent {a}");
+    }
+    if let Some(t) = &rec.task_hash {
+        run += &format!(" | task {t}");
+    }
+    if let Some(d) = &rec.dirty {
+        run += &format!(" | dirty {} {}", d.paths.len(), d.digest);
+    }
+    let mut out = format!("\n## {}\n\n{run}\n  `{}`\n", rec.task, rec.command);
+    for path in rec.dirty.iter().flat_map(|d| &d.paths) {
+        out += &format!("  dirty: {}\n", percent_encode(path));
+    }
+    for line in &rec.tail {
+        out += &format!("  > {line}\n");
+    }
+    out
+}
+
+/// Escape `%` and control characters so a path fits on one ledger line.
+fn percent_encode(s: &str) -> String {
+    s.chars().map(|c| if c == '%' || c.is_control() { format!("%{:02X}", c as u32) } else { c.to_string() }).collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out += &rest[..i];
+        match rest.get(i + 1..i + 3).and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32) {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[i + 3..];
+            }
+            None => {
+                out.push('%');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out + rest
+}
+
+/// FNV-1a 64-bit (public domain, http://www.isthe.com/chongo/tech/comp/fnv/), as 16 hex digits.
+/// It detects careless edits, not tampering.
+pub fn fingerprint(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{hash:016x}")
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = ProcCommand::new("git").args(args).current_dir(dir).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Files under `root`, outside `openspec/`, whose content differs from HEAD, untracked ones included.
+/// None outside a git repository or before the first commit. Read-only.
+pub fn dirty_paths(root: &Path) -> Option<Vec<String>> {
+    let scope = ["--", ".", ":(exclude)openspec"];
+    let changed = git(root, &[&["diff", "--name-only", "--relative", "-z", "HEAD"][..], &scope].concat())?;
+    let untracked = git(root, &[&["ls-files", "-z", "--others", "--exclude-standard"][..], &scope].concat())?;
+    let mut paths: Vec<String> = changed.split('\0').chain(untracked.split('\0')).filter(|p| !p.is_empty()).map(String::from).collect();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+/// Fingerprint of the current content of `paths` under `root`; a missing file counts as content.
+pub fn content_digest(root: &Path, paths: &[String]) -> String {
+    let files: Vec<&str> = paths.iter().filter(|p| root.join(p).is_file()).map(String::as_str).collect();
+    let blobs = if files.is_empty() { String::new() } else { git(root, &[&["hash-object", "--"][..], &files].concat()).unwrap_or_default() };
+    let mut blobs = blobs.lines();
+    let mut listing = String::new();
+    for path in paths {
+        let blob = if root.join(path).is_file() { blobs.next().unwrap_or("unreadable") } else { "missing" };
+        listing += &format!("{path}\0{blob}\n");
+    }
+    fingerprint(&listing)
+}
+
+/// The uncommitted state to record with a run, or None when the tree is clean or not in git.
+pub fn capture_dirty(root: &Path) -> Option<Dirty> {
+    let paths = dirty_paths(root)?;
+    if paths.is_empty() {
+        return None;
+    }
+    let digest = content_digest(root, &paths);
+    Some(Dirty { paths, digest })
 }
 
 /// Append one record, creating the ledger with its header on first write. Never rewrites existing bytes.
@@ -279,14 +394,18 @@ fn io_err(e: std::io::Error) -> CoreError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StaleReason {
     HeadMoved,
+    TaskChanged,
     SpecsSynced,
+    WorktreeChanged,
 }
 
 impl StaleReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             StaleReason::HeadMoved => "head-moved",
+            StaleReason::TaskChanged => "task-changed",
             StaleReason::SpecsSynced => "specs-synced",
+            StaleReason::WorktreeChanged => "worktree-changed",
         }
     }
 }
@@ -327,11 +446,14 @@ pub fn latest_spec_mtime(change_dir: &Path) -> Option<SystemTime> {
     latest
 }
 
-/// Staleness of one run, computed live (never cached) from the repo and change dir.
-/// Returns None when fresh, Some(reason) when stale.
-pub fn staleness(repo: &Path, change_dir: &Path, rec: &Record) -> Option<StaleReason> {
+/// Staleness of one run, computed live (never cached) from the repo, the change dir and the
+/// task as tasks.md states it now. Returns None when fresh, Some(reason) when stale.
+pub fn staleness(repo: &Path, change_dir: &Path, rec: &Record, task: &Task) -> Option<StaleReason> {
     if !head_is_ancestor(repo, &rec.head) {
         return Some(StaleReason::HeadMoved);
+    }
+    if rec.task_hash.as_ref().is_some_and(|h| *h != fingerprint(&task.title)) {
+        return Some(StaleReason::TaskChanged);
     }
     if let (Some(spec_mtime), Ok(run_at)) = (
         latest_spec_mtime(change_dir),
@@ -342,7 +464,54 @@ pub fn staleness(repo: &Path, change_dir: &Path, rec: &Record) -> Option<StaleRe
             return Some(StaleReason::SpecsSynced);
         }
     }
+    if let Some(d) = &rec.dirty
+        && content_digest(repo, &d.paths) != d.digest
+    {
+        return Some(StaleReason::WorktreeChanged);
+    }
     None
+}
+
+/// Last `n` non-empty lines of command output, with escape sequences and control characters
+/// removed and each line cut to 200 characters, ready for the ledger.
+pub fn output_tail(output: &[u8], n: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(output);
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|l| l.rsplit('\r').find(|seg| !seg.trim().is_empty()).unwrap_or(""))
+        .map(strip_escapes)
+        .map(|l| l.trim_end().chars().take(200).collect::<String>())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    lines.drain(..lines.len().saturating_sub(n));
+    lines
+}
+
+fn strip_escapes(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI sequences end at the first byte in @..~
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\t' {
+            out.push(' ');
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Index of the latest record per task: the last one in file order.
+pub fn latest_per_task(records: &[Record]) -> std::collections::HashMap<String, usize> {
+    records.iter().enumerate().map(|(i, r)| (r.task.clone(), i)).collect()
 }
 
 /// Parse all records from a ledger, in append order.
@@ -351,11 +520,23 @@ pub fn read_records(ledger: &Path) -> Vec<Record> {
     let mut records: Vec<Record> = Vec::new();
     let mut task = String::new();
     let mut pending: Option<Record> = None;
+    // lines after a record's command belong to it until the next section
+    let mut open = false;
     for line in md.lines() {
         let trimmed = line.trim();
         if let Some(header) = trimmed.strip_prefix("## ") {
             task = header.split_whitespace().next().unwrap_or("").to_string();
+            open = false;
+        } else if let Some(path) = trimmed.strip_prefix("dirty: ").filter(|_| open) {
+            if let Some(d) = records.last_mut().and_then(|r| r.dirty.as_mut()) {
+                d.paths.push(percent_decode(path));
+            }
+        } else if let Some(out) = line.strip_prefix("  > ").filter(|_| open) {
+            if let Some(r) = records.last_mut() {
+                r.tail.push(out.to_string());
+            }
         } else if let Some(run) = trimmed.strip_prefix("- run: ") {
+            open = false;
             // <date> | exit <n> | <x.x>s | head <h> | machine <m>
             let fields: Vec<&str> = run.split(" | ").collect();
             if fields.len() < 5 {
@@ -369,19 +550,26 @@ pub fn read_records(ledger: &Path) -> Vec<Record> {
                 head: fields[3].strip_prefix("head ").unwrap_or("").trim().to_string(),
                 date: fields[0].trim().to_string(),
                 machine: fields[4].strip_prefix("machine ").unwrap_or("").trim().to_string(),
-                agent: fields
-                    .get(5)
-                    .and_then(|f| f.strip_prefix("agent "))
-                    .map(|a| a.trim().to_string()),
+                agent: optional_field(&fields, "agent ").map(str::to_string),
+                task_hash: optional_field(&fields, "task ").map(str::to_string),
+                dirty: optional_field(&fields, "dirty ")
+                    .and_then(|d| d.split_once(' '))
+                    .map(|(_, digest)| Dirty { paths: Vec::new(), digest: digest.to_string() }),
+                tail: Vec::new(),
             });
         } else if let Some(cmd) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`'))
             && let Some(mut rec) = pending.take()
         {
             rec.command = cmd.to_string();
             records.push(rec);
+            open = true;
         }
     }
     records
+}
+
+fn optional_field<'a>(fields: &[&'a str], key: &str) -> Option<&'a str> {
+    fields.iter().skip(5).find_map(|f| f.strip_prefix(key)).map(str::trim)
 }
 
 #[cfg(test)]
@@ -405,6 +593,9 @@ mod tests {
             date: "2026-09-29T21:40:12+07:00".into(),
             machine: "goby".into(),
             agent: None,
+            task_hash: None,
+            dirty: None,
+            tail: Vec::new(),
         }
     }
 
@@ -618,18 +809,18 @@ mod tests {
         let mut rec = sample();
         rec.head = first.clone();
         // fresh: recorded head is the current HEAD
-        assert_eq!(staleness(&repo, &repo, &rec), None);
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
         // fresh: recorded head becomes an ancestor
         fs::write(repo.join("a.txt"), "2\n").unwrap();
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-q", "-m", "b"]);
-        assert_eq!(staleness(&repo, &repo, &rec), None);
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
         // stale: recorded head not an ancestor (HEAD is back on main, other branch head is not its ancestor)
         run_git(&repo, &["checkout", "-q", "-b", "other", first.as_str()]);
         run_git(&repo, &["commit", "-q", "-m", "c", "--allow-empty"]);
         rec.head = read_head(&repo);
         run_git(&repo, &["checkout", "-q", "-"]);
-        assert_eq!(staleness(&repo, &repo, &rec), Some(StaleReason::HeadMoved));
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), Some(StaleReason::HeadMoved));
     }
 
     #[test]
@@ -645,11 +836,79 @@ mod tests {
         fs::write(specs.join("delta.md"), "## ADDED\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         rec.date = Record::now_date();
-        assert_eq!(staleness(&repo, &repo, &rec), None);
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
         // spec rewritten after the run: stale
         std::thread::sleep(std::time::Duration::from_millis(50));
         fs::write(specs.join("delta.md"), "## MODIFIED\n").unwrap();
-        assert_eq!(staleness(&repo, &repo, &rec), Some(StaleReason::SpecsSynced));
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), Some(StaleReason::SpecsSynced));
+    }
+
+    fn task() -> Task {
+        Task { id: "2.1".into(), title: "do it; verify cargo test".into() }
+    }
+
+    #[test]
+    fn staleness_task_changed_and_worktree_changed() {
+        let repo = scratch("stale-new");
+        run_git(&repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "a"]);
+        fs::create_dir_all(repo.join("openspec")).unwrap();
+        fs::write(repo.join("openspec/alibi.md"), "ledger\n").unwrap();
+        assert_eq!(capture_dirty(&repo), None, "openspec/ is not part of the tested tree");
+        let mut rec = sample();
+        rec.head = read_head(&repo);
+        rec.date = Record::now_date();
+        rec.task_hash = Some(fingerprint(&task().title));
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
+        let edited = Task { title: "do it; verify cargo test -p x".into(), ..task() };
+        assert_eq!(staleness(&repo, &repo, &rec, &edited), Some(StaleReason::TaskChanged));
+        // proof taken on an uncommitted edit and a new file
+        fs::write(repo.join("a.txt"), "2\n").unwrap();
+        fs::write(repo.join("b.txt"), "new\n").unwrap();
+        rec.dirty = capture_dirty(&repo);
+        assert_eq!(rec.dirty.as_ref().unwrap().paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
+        // committing exactly what was tested keeps the proof fresh
+        run_git(&repo, &["add", "a.txt", "b.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "b"]);
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), None);
+        // editing a tested file after the run makes it stale
+        fs::write(repo.join("a.txt"), "3\n").unwrap();
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), Some(StaleReason::WorktreeChanged));
+        fs::write(repo.join("a.txt"), "2\n").unwrap();
+        fs::remove_file(repo.join("b.txt")).unwrap();
+        assert_eq!(staleness(&repo, &repo, &rec, &task()), Some(StaleReason::WorktreeChanged));
+    }
+
+    #[test]
+    fn round_trip_with_all_optional_fields() {
+        let dir = scratch("all-fields");
+        let ledger = ledger_path(&dir);
+        let mut rec = sample();
+        rec.agent = Some("verify".into());
+        rec.task_hash = Some(fingerprint("x"));
+        rec.dirty = Some(Dirty { paths: vec!["src/a b.rs".into(), "100%\nodd".into()], digest: "0123456789abcdef".into() });
+        rec.tail = vec!["test result: ok. 3 passed".into(), "## not a header".into(), "  dirty: not a path".into()];
+        append_record(&ledger, "c", &rec).unwrap();
+        append_record(&ledger, "c", &sample()).unwrap();
+        assert_eq!(read_records(&ledger), vec![rec, sample()]);
+    }
+
+    #[test]
+    fn task_lines_accept_openspec_bullets() {
+        let md = "* [ ] 1.1 star\n+ [x] 1.2 plus\n1. [ ] 1.3 ordered\n2) [X] 1.4 paren\n  - [ ] 1.5 indented\n- [ ] write docs\n- [ ](link) 9.9 not a task\n- [ab] 9.8 not a task\n";
+        let ids: Vec<String> = parse_tasks(md).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["1.1", "1.2", "1.3", "1.4", "1.5"]);
+        assert_eq!(unnumbered_tasks(md), vec!["write docs".to_string()]);
+    }
+
+    #[test]
+    fn output_tail_keeps_last_clean_lines() {
+        let out = b"a\n\x1b[32mok\x1b[0m\n\nprogress 1\rprogress 2\r\n\tdone\n";
+        assert_eq!(output_tail(out, 3), vec!["ok", "progress 2", " done"]);
+        assert_eq!(output_tail(b"", 5), Vec::<String>::new());
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
