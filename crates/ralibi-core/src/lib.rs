@@ -72,7 +72,14 @@ pub fn parse_tasks(md: &str) -> Vec<Task> {
         // task lines: "- [ ] 1.1 ..." / "- [x] 1.1 ..."
         let Some(after_box) = trimmed.strip_prefix("- [").and_then(|r| r.split_once(']')) else { continue };
         let rest = after_box.1.trim_start();
-        let Some((id, title)) = rest.split_once(char::is_whitespace) else { continue };
+        let Some((id, title)) = rest.split_once(char::is_whitespace) else {
+            // `- [x] 1.1` with no title: a task id alone still names a provable task
+            let id = rest.trim_end_matches('.');
+            if id.split('.').count() >= 2 && id.bytes().all(|c| c.is_ascii_digit() || c == b'.') && !id.is_empty() {
+                tasks.push(Task { id: id.to_string(), title: String::new() });
+            }
+            continue;
+        };
         let id = id.trim_end_matches('.');
         if id.split('.').count() >= 2 && id.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
             tasks.push(Task { id: id.to_string(), title: title.trim().to_string() });
@@ -520,5 +527,15 @@ mod tests {
         assert_eq!(tasks[0].id, "1.1");
         assert!(tasks[0].title.starts_with("Create workspace"));
         assert_eq!(tasks[1].id, "1.2");
+    }
+
+    #[test]
+    fn parse_tasks_allows_missing_title() {
+        let md = "# Tasks\n\n- [x] 1.1\n- [ ] 2.10\n- [ ] 3\n- [ ] x.1\n";
+        let tasks = parse_tasks(md);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "1.1");
+        assert_eq!(tasks[1].id, "2.10");
+        assert!(tasks.iter().all(|t| t.title.is_empty()));
     }
 }
